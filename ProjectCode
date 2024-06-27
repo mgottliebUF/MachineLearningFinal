@@ -1,0 +1,324 @@
+# Import necessary libraries
+import yfinance as yf
+import pandas as pd
+import numpy as np
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.metrics import mean_squared_error, explained_variance_score, r2_score
+import matplotlib.pyplot as plt
+from fpdf import FPDF
+import ipywidgets as widgets
+from IPython.display import display
+
+def get_stock_data(ticker, retries=3, delay=5):
+    for attempt in range(retries):
+        try:
+            data = yf.download(ticker, start="2023-01-01", end=pd.Timestamp.today().strftime('%Y-%m-%d'), interval='1d')
+            if data.empty:
+                raise ValueError(f"No data found for ticker '{ticker}'")
+            return data
+        except Exception as e:
+            print(f"Attempt {attempt + 1} failed: {e}")
+            if attempt < retries - 1:
+                time.sleep(delay)  # wait before retrying
+            else:
+                print(f"Failed to get ticker '{ticker}' after {retries} attempts")
+                return None
+
+def calculate_performance_metrics(test_target, predictions):
+    mse = mean_squared_error(test_target, predictions)
+    rmse = np.sqrt(mse)
+    evs = explained_variance_score(test_target, predictions)
+    r2 = r2_score(test_target, predictions)
+    
+    return rmse, evs, r2
+
+def backtest_strategy(test_target, predictions, max_trades_per_week=4, initial_investment=10000):
+    cash = initial_investment
+    stock_held = 0
+    transactions = []
+    daily_profits = []
+    trade_count = 0
+    last_trade_date = None
+
+    for i in range(1, len(predictions)):
+        current_date = test_target.index[i]
+        current_week = current_date.isocalendar()[1]
+        
+        if last_trade_date is not None and current_week == last_trade_date.isocalendar()[1]:
+            if trade_count >= max_trades_per_week:
+                daily_profits.append(0)  # No trade, no profit
+                continue  # Skip to the next day
+        else:
+            trade_count = 0  # Reset trade count for the new week
+        
+        previous_cash = cash
+        previous_stock_value = stock_held * test_target.iloc[i-1] if stock_held > 0 else 0
+        previous_total_value = previous_cash + previous_stock_value
+        
+        if predictions[i] > test_target.iloc[i-1]:  # If predicted price is higher than previous day's actual price
+            # Buy signal
+            if cash > 0:
+                stock_bought = cash / test_target.iloc[i]
+                stock_held += stock_bought  # Buy as much stock as possible
+                transactions.append((current_date, 'BUY', stock_bought, test_target.iloc[i]))
+                cash = 0
+                trade_count += 1
+                last_trade_date = current_date
+        else:
+            # Sell signal
+            if stock_held > 0:
+                cash += stock_held * test_target.iloc[i]  # Sell all stock
+                transactions.append((current_date, 'SELL', stock_held, test_target.iloc[i]))
+                stock_held = 0
+                trade_count += 1
+                last_trade_date = current_date
+        
+        current_cash = cash
+        current_stock_value = stock_held * test_target.iloc[i] if stock_held > 0 else 0
+        current_total_value = current_cash + current_stock_value
+        
+        daily_profit = (current_total_value - previous_total_value) / previous_total_value
+        daily_profits.append(daily_profit)
+    
+    final_value = cash + stock_held * test_target.iloc[-1]
+    total_profit_percentage = (final_value / initial_investment - 1) * 100
+    
+    return transactions, final_value, daily_profits, total_profit_percentage
+
+def print_performance_metrics(rmse, evs, r2):
+    print(f'Root Mean Squared Error (RMSE): {rmse}')
+    print(' - RMSE measures the average magnitude of the errors between predicted and actual values. Lower values indicate better performance.')
+    print(f'Explained Variance Score (EVS): {evs}')
+    print(' - EVS measures the proportion of variance explained by the model. It ranges from 0 to 1, where 1 indicates perfect prediction.')
+    print(f'R^2 Score: {r2}')
+    print(' - R^2 (coefficient of determination) indicates how well the predicted values match the actual values. It ranges from 0 to 1, where 1 means perfect prediction.')
+
+def calculate_sharpe_ratio(daily_profits, risk_free_rate=0.01):
+    mean_daily_return = np.mean(daily_profits)
+    std_daily_return = np.std(daily_profits)
+    sharpe_ratio = (mean_daily_return - risk_free_rate) / std_daily_return
+    return sharpe_ratio
+
+def save_to_pdf(report_title, stock_ticker, best_overall_k, best_overall_profit, best_overall_sharpe_ratio, best_overall_recommendation, best_overall_price, transactions_df, daily_profits, total_profit_percentage):
+    pdf = FPDF()
+    pdf.add_page()
+
+    pdf.set_font("Arial", 'B', 16)
+    pdf.cell(200, 10, report_title, ln=True, align='C')
+    
+    pdf.set_font("Arial", 'B', 12)
+    pdf.cell(200, 10, f"Best Performing Stock: {stock_ticker}", ln=True)
+    pdf.cell(200, 10, f"Best Model: k={best_overall_k}", ln=True)
+    pdf.cell(200, 10, f"Profit: ${best_overall_profit:.2f}", ln=True)
+    pdf.cell(200, 10, f"Sharpe Ratio: {best_overall_sharpe_ratio:.2f}", ln=True)
+    pdf.cell(200, 10, f"Current Recommendation: {best_overall_recommendation} at price ${best_overall_price:.2f}", ln=True)
+    pdf.cell(200, 10, f"Total Profit Percentage: {total_profit_percentage:.2f}%", ln=True)
+    pdf.cell(200, 10, f"Percentage Profit per Day: {np.mean(daily_profits) * 100:.2f}%", ln=True)
+    
+    pdf.cell(200, 10, "Transactions Table:", ln=True)
+    
+    pdf.set_font("Arial", '', 10)
+    for i in range(len(transactions_df)):
+        pdf.cell(200, 10, f"{transactions_df.iloc[i]['Date']} - {transactions_df.iloc[i]['Action']} - {transactions_df.iloc[i]['Shares']} shares at ${transactions_df.iloc[i]['Price']} - Profit: ${transactions_df.iloc[i]['Profit']:.2f}", ln=True)
+    
+    pdf.output("stock_analysis_report.pdf")
+    print("PDF report generated: stock_analysis_report.pdf")
+
+def analyze_stock(stock_ticker, k_values):
+    best_overall_k = None
+    best_overall_profit = -float('inf')
+    best_overall_sharpe_ratio = None
+    best_overall_recommendation = None
+    best_overall_price = None
+    best_overall_transactions_df = None
+    best_overall_daily_profits = None
+    best_overall_total_profit_percentage = None
+    
+    print(f"\nAnalyzing stock: {stock_ticker}")
+    
+    # Fetch historical stock data for the current year
+    data = get_stock_data(stock_ticker)
+    
+    if data is not None:
+        print("Data retrieved successfully")
+        
+        # Prepare the data
+        print("Preparing the data...")
+        data['Price_Change'] = data['Close'].pct_change()
+        data['High_Low_Spread'] = data['High'] - data['Low']
+        data['Average_Price'] = (data['High'] + data['Low']) / 2
+        data.dropna(inplace=True)
+
+        # Define the features and target variable
+        features = data[['Close', 'High_Low_Spread', 'Average_Price']]
+        target = data['Close'].shift(-1)  # Predict next day's closing price
+        features = features[:-1]  # Drop the last row to match the target
+        target = target[:-1]  # Drop the last row as it has NaN target
+
+        # Split the data into training (first 80%) and testing (last 20%) sets
+        train_size = int(len(features) * 0.8)
+        train_features, test_features = features[:train_size], features[train_size:]
+        train_target, test_target = target[:train_size], target[train_size:]
+
+        # Ensure there are no NaN values in the test_target
+        test_features = test_features[~test_target.isna()]
+        test_target = test_target.dropna()
+
+        best_k = None
+        best_profit = -float('inf')
+        best_recommendation = None
+        best_price = None
+        best_sharpe_ratio = None
+        best_transactions_df = None
+        best_daily_profits = None
+        best_total_profit_percentage = None
+
+        for k in k_values:
+            print(f"\nRunning kNN with k={k}...")
+            # Initialize and train the kNN model
+            knn = KNeighborsRegressor(n_neighbors=k)
+            knn.fit(train_features, train_target)
+
+            # Predict stock prices
+            predictions = knn.predict(test_features)
+
+            # Calculate performance metrics
+            rmse, evs, r2 = calculate_performance_metrics(test_target, predictions)
+            
+            # Print performance metrics explanations
+            print("\nPerformance Metrics Explanation:")
+            print("Root Mean Squared Error (RMSE): Measures the average magnitude of the errors between predicted and actual values. Lower values indicate better performance.")
+            print("Explained Variance Score (EVS): Measures the proportion of variance explained by the model. It ranges from 0 to 1, where 1 indicates perfect prediction.")
+            print("R^2 Score: Indicates how well the predicted values match the actual values. It ranges from 0 to 1, where 1 means perfect prediction.")
+            
+            # Print the performance metrics
+            print_performance_metrics(rmse, evs, r2)
+
+            # Plot actual vs predicted prices
+            plt.figure(figsize=(14, 7))
+            plt.plot(test_target.index, test_target, label='Actual Prices', color='blue')
+            plt.plot(test_target.index, predictions, label='Predicted Prices', color='red')
+            plt.title(f'Stock Price Prediction for {stock_ticker} using kNN (k={k})')
+            plt.xlabel('Date')
+            plt.ylabel('Stock Price')
+            plt.legend()
+            plt.show()
+
+            # Backtest the strategy
+            print("\nBacktesting the strategy...")
+            transactions, final_value, daily_profits, total_profit_percentage = backtest_strategy(test_target, predictions)
+
+            print(f'\nInitial Investment: 10000')
+            print(f'Final Value after Backtesting: {final_value}')
+            print(f'Total Profit Percentage: {total_profit_percentage:.2f}%')
+            
+            sharpe_ratio = calculate_sharpe_ratio(daily_profits)
+
+            if final_value > best_profit:
+                best_k = k
+                best_profit = final_value
+                best_recommendation = "BUY" if predictions[-1] > test_target.iloc[-1] else "SELL"
+                best_price = test_target.iloc[-1]
+                best_sharpe_ratio = sharpe_ratio
+                best_transactions_df = pd.DataFrame(transactions, columns=['Date', 'Action', 'Shares', 'Price'])
+                best_transactions_df['Profit'] = best_transactions_df.apply(lambda row: (row['Shares'] * row['Price'] if row['Action'] == 'SELL' else -row['Shares'] * row['Price']), axis=1).cumsum()
+                best_daily_profits = daily_profits
+                best_total_profit_percentage = total_profit_percentage
+
+            # Recommendation based on the last prediction
+            recommendation = "BUY" if predictions[-1] > test_target.iloc[-1] else "SELL"
+            print(f'Recommendation: {recommendation}')
+
+            # Plot the signals on the price chart
+            plt.figure(figsize=(14, 7))
+            plt.plot(test_target.index, test_target, label='Actual Prices', color='blue')
+            for transaction in transactions:
+                if transaction[1] == 'BUY':
+                    plt.axvline(transaction[0], color='green', linestyle='--', lw=1)
+                elif transaction[1] == 'SELL':
+                    plt.axvline(transaction[0], color='red', linestyle='--', lw=1)
+            plt.title(f'Trading Signals for {stock_ticker} (k={k})')
+            plt.xlabel('Date')
+            plt.ylabel('Stock Price')
+            plt.legend()
+            plt.show()
+
+        return (best_k, best_profit, best_sharpe_ratio, best_recommendation, best_price, best_transactions_df, best_daily_profits, best_total_profit_percentage)
+    else:
+        print("Failed to retrieve stock data. Please try again with a different ticker.")
+        return None
+
+def generate_pdf_button_handler(event):
+    save_to_pdf("Stock Analysis Report", stock_ticker, best_k, best_profit, best_sharpe_ratio, best_recommendation, best_price, best_transactions_df, best_daily_profits, best_total_profit_percentage)
+
+def input_trades():
+    trades = []
+    for i in range(3):
+        ticker = input(f"Enter the ticker for trade {i+1}: ").strip().upper()
+        purchase_price = float(input(f"Enter the purchase price for {ticker}: ").strip())
+        shares = float(input(f"Enter the number of shares for {ticker}: ").strip())
+        trades.append((ticker, purchase_price, shares))
+    return trades
+
+# Get the recommended k values from user input
+k_values = input("Enter three different k values separated by commas (e.g., 3,6,8): ").strip().split(',')
+k_values = [int(k.strip()) for k in k_values]
+
+# Get the stock ticker from user input
+stock_ticker = input("Enter the stock ticker symbol for analysis: ").strip().upper()
+
+# Input trades from the user
+trades = input_trades()
+
+# Analyze the specified stock
+result = analyze_stock(stock_ticker, k_values)
+
+# Determine the best performing model
+if result:
+    best_k, best_profit, best_sharpe_ratio, best_recommendation, best_price, best_transactions_df, best_daily_profits, best_total_profit_percentage = result
+
+    # Bold statements for best performing model and current recommendation
+    print(f"\n\n\033[1mBest Performing Stock: {stock_ticker} with k={best_k} and a profit of ${best_profit:.2f}\033[0m")
+    print(f"\033[1mCurrent Recommendation: {best_recommendation} at price ${best_price:.2f}\033[0m")
+    print(f"\033[1mPercentage Profit per Day: {np.mean(best_daily_profits) * 100:.2f}%\033[0m")
+    print(f"\033[1mTotal Profit Percentage: {best_total_profit_percentage:.2f}%\033[0m")
+    print(f"\033[1mSharpe Ratio: {best_sharpe_ratio:.2f}\033[0m")
+
+    # Display trades
+    print("\nEntered Trades:")
+    for trade in trades:
+        ticker, purchase_price, shares = trade
+        current_price = yf.Ticker(ticker).history(period='1d')['Close'].iloc[-1]
+        profit = (current_price - purchase_price) * shares
+        # Recommendation logic based on profit/loss and KNN model prediction
+        if profit > 0:
+            if best_recommendation == "SELL":
+                recommended_action = "SELL"
+            else:
+                recommended_action = "HOLD"
+        else:
+            if best_recommendation == "BUY":
+                recommended_action = "BUY"
+            else:
+                recommended_action = "HOLD"
+        print(f"Ticker: {ticker}, Purchase Price: {purchase_price}, Shares: {shares}, Current Price: {current_price}, Profit: {profit}, Recommended Action: {recommended_action}")
+
+    # PDF generation button
+    button = widgets.Button(description="Generate PDF for this stock")
+    button.on_click(generate_pdf_button_handler)
+    display(button)
+
+    # Explain the logic to the user
+    print("\nExplanation of the buy/sell logic:")
+    print("1. We predict the next day's closing price using the k-Nearest Neighbors (kNN) algorithm.")
+    print("2. If the predicted price for the next day is higher than the current day's actual price, it's a 'BUY' signal.")
+    print("3. If the predicted price for the next day is lower than the current day's actual price, it's a 'SELL' signal.")
+    print("4. We start with an initial investment and simulate buying and selling based on these signals.")
+    print("5. At the end of the backtesting period, we calculate the final value of the investment.")
+    print("6. The final recommendation is based on the last predicted price compared to the last actual price.\n")
+    print("7. The transactions table shows each buy and sell action, the number of shares involved, the price at which the transaction occurred, and the cumulative profit over time.\n")
+    print("8. Changing the value of 'k' in kNN affects the smoothness of the predictions. A smaller 'k' makes the model more sensitive to small fluctuations, while a larger 'k' smooths out the predictions. Comparing different 'k' values helps determine the best choice for your strategy.\n")
+    print("9. The model is limited to a maximum of 4 trades per week to prevent overtrading and ensure more realistic trading behavior.\n")
+
+else:
+    print("No valid stock data was retrieved for analysis.")
